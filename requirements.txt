@@ -1,0 +1,10 @@
+pandas
+scikit-learn
+matplotlib
+arch
+requests
+scipy
+seaborn
+sktime
+numpy==1.26.4
+pmdarima
