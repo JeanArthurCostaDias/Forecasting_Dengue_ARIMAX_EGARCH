@@ -1,3 +1,4 @@
+
 import os
 import numpy as np
 import pandas as pd
@@ -19,8 +20,26 @@ from sklearn.model_selection import train_test_split
 from sklearn.exceptions import ConvergenceWarning
 from scipy.stats import skew
 import matplotlib.patches as mpatches
-import matplotlib.dates as mdates
+from statsmodels.tsa.stattools import ccf
+from scipy import stats
 import shutil
+import matplotlib.dates as mdates
+
+warnings.filterwarnings('ignore',category=FutureWarning)
+warnings.filterwarnings('ignore',category=ConvergenceWarning)
+
+def get_csv(url, local_filename):
+  full_path = os.path.join("dados", local_filename)
+  try:
+    response = requests.get(url, stream=True)
+    response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+    with open(full_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+    print(f"File '{local_filename}' downloaded successfully.")
+  except requests.exceptions.RequestException as e:
+    print(f"An error occurred: {e}")
 
 def recreate_dir(path):
     # se a pasta já existe, apaga ela com tudo dentro
@@ -30,48 +49,42 @@ def recreate_dir(path):
     os.makedirs(path)
 
 
-# -----------------------------
-# Download do CSV
-# -----------------------------
-
-def get_dengue_csv(url, local_filename):
-    try:
-        full_path = os.path.join("dados", local_filename)
-
-        response = requests.get(url, stream=True)
-        response.raise_for_status()  # levanta exceção para códigos 4xx/5xx
-        with open(full_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        print(f"Arquivo '{full_path}' baixado com sucesso.")
-    except requests.exceptions.RequestException as e:
-        print(f"Ocorreu um erro: {e}")
+recreate_dir("dados")
+recreate_dir("figs")
+recreate_dir("resultados_modelos")
+recreate_dir("resultado_metricas")
+recreate_dir("resultados_figuras")
 
 
-# -----------------------------
-# Análise Exploratória
-# -----------------------------
 
-def plot_kde_dengue(original, log_transformed):
+file_url_dengue = "https://huggingface.co/datasets/JeanDias/InfoDengue_Belem/resolve/main/dengue_34-1.csv"
+local_filename_dengue = "dengue.csv"
+get_csv(file_url_dengue, local_filename_dengue)
+file_url_precip = "https://huggingface.co/datasets/JeanDias/InfoDengue_Belem/resolve/main/prec_Belem_2010_2024.csv"
+local_filename_precip = "prec.csv"
+get_csv(file_url_precip, local_filename_precip)
+
+sns.set(style="whitegrid")  # estilo Seaborn
+
+def plot_kde_dengue(original, transformed):
     fig, axes = plt.subplots(1, 2, figsize=(14,5))
 
     # Calcular skewness
     skew_orig = skew(original)
-    skew_log = skew(log_transformed)
+    skew_log = skew(transformed)
 
     # KDE da série original
     sns.kdeplot(original, ax=axes[0], fill=True, color="skyblue", linewidth=2)
     axes[0].set_title("Distribuição original (a)", fontsize=12)
     axes[0].set_xlabel("Casos")
     axes[0].set_ylabel("Densidade")
-    axes[0].text(0.95, 0.95, f"Skew: {skew_orig:.2f}",
+    axes[0].text(0.95, 0.95, f"Assímetria: {skew_orig:.2f}",
                  horizontalalignment='right', verticalalignment='top',
                  transform=axes[0].transAxes, fontsize=11, color="darkblue")
 
     # KDE da série log transformada
-    sns.kdeplot(log_transformed, ax=axes[1], fill=True, color="salmon", linewidth=2)
-    axes[1].set_title("Distribuição log (b)", fontsize=12)
+    sns.kdeplot(transformed, ax=axes[1], fill=True, color="salmon", linewidth=2)
+    axes[1].set_title("Distribuição transformada (b)", fontsize=12)
     axes[1].set_xlabel("log1p(Casos)")
     axes[1].set_ylabel("Densidade")
     axes[1].text(0.95, 0.95, f"Assímetria: {skew_log:.2f}",
@@ -82,10 +95,10 @@ def plot_kde_dengue(original, log_transformed):
     plt.savefig("./figs/distribuicao_casos_sns_skew.png", dpi=300)
     plt.show()
 
-def plot_periodogram(log_transformed, fs=1):
+def plot_periodogram(log_transformed, fs=1, max_lag=52):
     freqs, power = periodogram(log_transformed, fs=fs)
     periods = 1 / freqs
-    mask = (periods <= 52) & (periods > 1)
+    mask = (periods <= (max_lag) + 1) & (periods > 1)
 
     top_idx = np.argsort(power[mask])[-3:][::-1]
     top_periods = periods[mask][top_idx]
@@ -96,7 +109,7 @@ def plot_periodogram(log_transformed, fs=1):
     sns.scatterplot(x=top_periods, y=top_powers, color="red", s=80, zorder=5, label="Top 3 picos")
 
     for p, pw in zip(top_periods, top_powers):
-        plt.text(p, pw*1.05, f"{p:.1f}", fontsize=10, ha="center", va="bottom")
+        plt.text(p, pw*1.05, f"{round(p)}", fontsize=10, ha="center", va="bottom")
 
     plt.ylim(0, power[mask].max()*1.2)
     plt.title("Periodograma (log transformado)", fontsize=12)
@@ -110,54 +123,96 @@ def plot_periodogram(log_transformed, fs=1):
 
     return top_periods
 
-# -----------------------------
-# Pré-processamento
-# -----------------------------
 
-def get_lag_exogenous_variables(df):
-  variables_dataframe = df.copy()
-  for col in variables_dataframe.columns:
-      for lag in range(1,5):
-          variables_dataframe[f'{col}_lag{lag}'] = variables_dataframe[col].shift(lag)
-  return variables_dataframe.dropna()
+def select_top_corr_vars(df, target, quantile=0.75):
+    corr = df.corrwith(target).abs()
+    threshold = corr.quantile(quantile)
+    top_vars = corr[corr >= threshold].index.tolist()
+    return top_vars
 
 
-def get_correlation_map(df):
-    plt.figure(figsize=(20, 12))
-    sns.heatmap(df.corr(), annot=True, cmap='coolwarm', fmt=".2f")
-    plt.title('Heatmap de Correlação das Variáveis Climáticas')
-    plt.savefig("./figs/heatmap_correlacao_clima.png")
-    plt.show()
-
-def preprocessing_data(df, top_periods):
+def fourie_pca_data(df, top_periods, target, quantile=0.75):
     exogenous_variables = df.copy()
 
-    # Normalization
-    scaler = StandardScaler()
-    scaled_variables = scaler.fit_transform(exogenous_variables)
-    scaled_variables = pd.DataFrame(
-        scaled_variables,
-        index=exogenous_variables.index,
-        columns=exogenous_variables.columns
-    )
-
-    # Fourier Terms
-    t = np.arange(len(scaled_variables))
+    t = np.arange(len(exogenous_variables))
     for i, period in enumerate(top_periods, 1):
-        scaled_variables[f'sin_{i}'] = np.sin(2 * np.pi * t / period)
-        scaled_variables[f'cos_{i}'] = np.cos(2 * np.pi * t / period)
+        exogenous_variables[f'sin_{i}'] = np.sin(2 * np.pi * t / period)
+        exogenous_variables[f'cos_{i}'] = np.cos(2 * np.pi * t / period)
 
-    # PCA apenas nas colunas originais
-    colunas_alta_c = exogenous_variables.columns
+    top_vars = select_top_corr_vars(df.drop(columns=[df.columns[0]]), target, quantile=quantile)
+
+    # PCA apenas nas colunas top
+    exogenous_variables = exogenous_variables.dropna()
     pca = PCA(n_components=0.95)
-    pca_features = pca.fit_transform(scaled_variables[colunas_alta_c])
+    pca_features = pca.fit_transform(exogenous_variables[top_vars])
     column_names = [f'pca_{i+1}' for i in range(pca_features.shape[1])]
-    pca_df = pd.DataFrame(pca_features, columns=column_names, index=scaled_variables.index)
+    pca_df = pd.DataFrame(pca_features, columns=column_names, index=exogenous_variables.index)
 
     # Concatenar Fourier + PCA
-    exogenous_variables_all = pd.concat([scaled_variables.drop(columns=colunas_alta_c), pca_df], axis=1)
-
+    exogenous_variables_all = pd.concat([exogenous_variables.drop(columns=top_vars), pca_df], axis=1)
     return exogenous_variables_all
+
+# --- Função de pré-processamento ---
+def preprocess_exog(df, boxcox_vars=None, standard_vars=None):
+    df_proc = df.copy()
+    if boxcox_vars:
+        for var in boxcox_vars:
+            df_proc[var] = stats.boxcox(df_proc[var])[0]
+    if standard_vars:
+        std_model = StandardScaler()
+        for var in standard_vars:
+            df_proc[var] = std_model.fit_transform(df_proc[var].to_frame())
+    return df_proc
+
+# --- Função para calcular CCF e melhores lags ---
+def compute_best_lags(df_exog, y, max_lag=52):
+    ccf_all = pd.concat([
+        pd.DataFrame({
+            'variable': name,
+            'lag': np.arange(max_lag+1),
+            'correlation': ccf(series, y, adjusted=False)[:max_lag+1],
+            'abs_corr': np.abs(ccf(series, y, adjusted=False)[:max_lag+1])
+        })
+        for name, series in df_exog.items()
+    ], ignore_index=True)
+
+    best_lags = ccf_all.loc[ccf_all.groupby("variable")["abs_corr"].idxmax()].sort_values("abs_corr", ascending=False)
+    return ccf_all, best_lags
+
+# --- Função para plotar CCF com melhores lags ---
+def plot_ccf(ccf_all, best_lags, title="CCF entre Y e variáveis exógenas"):
+    plt.figure(figsize=(12,6))
+    sns.lineplot(data=ccf_all, x="lag", y="correlation", hue="variable")
+    for _, r in best_lags.iterrows():
+        plt.scatter(
+            r["lag"], r["correlation"],
+            s=120, marker="o", edgecolors="k", linewidth=1.2,
+            label=f"Best lag {r['variable']} = {int(r['lag'])}"
+        )
+    plt.axhline(0, color="black", linestyle="--", linewidth=1)
+    plt.title(title)
+    plt.xlabel("Lag (semanas)")
+    plt.ylabel("Correlação cruzada")
+    plt.legend(title="Variável", bbox_to_anchor=(1.05,1), loc="upper left")
+    plt.tight_layout()
+    plt.savefig("./figs/ccf_exog.png", dpi=300)
+    plt.show()
+
+# --- Função para construir df_reg com melhores lags ---
+def build_regression_df(y, df_exog, best_lags):
+    df_reg = y.to_frame()
+    for _, r in best_lags.iterrows():
+        s = df_exog[r['variable']]
+        df_reg[f"{r['variable']}_lag{int(r['lag'])}"] = s.shift(int(r['lag']))
+    return df_reg
+
+def get_correlation_map(df):
+    corr_matrix = df.corr()
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr_matrix, annot=True, cmap="coolwarm", fmt=".2f")
+    plt.title("Correlação das Covariáveis")
+    plt.savefig("./figs/corr_matrix.png", dpi=300)
+    plt.show()
 
 # -----------------------------
 # Funções auxiliares
@@ -174,7 +229,7 @@ def train_arima(y_train, X_train):
         suppress_warnings=True,
         stepwise=False,
         n_jobs=-1,
-        n_fits=50,
+        n_fits=100,
         random=True
     )
     model = forecaster.fit(y=y_train, X=X_train)
@@ -255,7 +310,10 @@ def predict(arima_model, garch_model,horizon, X_test):
 def train_forecast_pipeline(y_train, X_train, X_test, horizon,
                             use_garch=True, vol='EGARCH'):
     arima_model = train_arima(y_train, X_train)
-    residuals = get_resid(arima_model, y_train, X_train)
+    residuals = get_resid(arima_model, y_train, X_train)[1:]
+    print("Resíduos do ARIMA:")
+    print(residuals)
+    print("========================")
 
     if use_garch:
         best_p, best_q, best_o, best_mean = find_best_garch(residuals, vol=vol)
@@ -287,9 +345,6 @@ def avaliar_modelo(path_csv, titulo):
     plt.fill_between(forecast.index, upper, lower,
                      color="blue", alpha=0.2, label="PI 95%")
     plt.title(f"Rolling Forecast ( {titulo} )")
-    plt.savefig(f"./figs/rolling_forecast_{titulo.replace(' ', '_').replace('+', 'plus').replace('(', '').replace(')', '')}.png", dpi=300)
-    plt.xlabel("Data")
-    plt.ylabel("Casos de Dengue (Escala Original)")
     plt.legend()
     plt.show()
 
@@ -331,7 +386,7 @@ def avaliar_modelo(path_csv, titulo):
 
 
 # ------------------------------------------
-# Treinamento e Inferência Com Rolling Forecast
+# Função geral para Treinamento e Inferência
 # ------------------------------------------
 
 def run_rolling_forecast(y_train, y_test, X_train, X_test, parameters, horizon, z, split_name):
@@ -351,11 +406,21 @@ def run_rolling_forecast(y_train, y_test, X_train, X_test, parameters, horizon, 
             use_garch=parameters[0],
             vol=parameters[1]
         )
-
+        print('=======================')
+        print("pred")
+        print(y_pred)
+        print("std")
+        print(predicted_std)
+        print('=======================')
         # ---------- Desfazer log1p ----------
         y_final_pred = np.expm1(y_pred + 0.5*predicted_std**2)
         upper = np.expm1(y_pred + z * predicted_std)
         lower = np.expm1(y_pred - z * predicted_std)
+
+        print(f'Previsto: {y_final_pred[0]:.2f} | Observado: {np.expm1(y_test.iloc[i]):.2f}')
+        print(f'PI 95%: [{lower[0]:.2f}, {upper[0]:.2f}]')
+        print('-----------------------')
+        print()
 
         # ---------- Armazenar ----------
         rolling_preds.append(y_final_pred)
@@ -454,67 +519,80 @@ def plot_forecast_grid(df_all, filename="resultados_forecast.png"):
     plt.savefig(os.path.join('resultados_figuras',filename), dpi=300)
     plt.show()
 
-
-# -----------------------------
-# Debug Config
-# -----------------------------
-warnings.filterwarnings('ignore',category=FutureWarning)
-warnings.filterwarnings('ignore',category=ConvergenceWarning)
-sns.set(style="whitegrid")  # estilo Seaborn
-recreate_dir("dados")
-recreate_dir("figs")
-recreate_dir("resultados_modelos")
-recreate_dir("resultado_metricas")
-recreate_dir("resultados_figuras")
-
-# -----------------------------
-# 0. Download do CSV
-# -----------------------------
-
-file_url = "https://huggingface.co/datasets/JeanDias/InfoDengue_Belem/resolve/main/dengue_34-1.csv"
-local_filename = "dengue_34-1.csv"
-get_dengue_csv(file_url, local_filename)
-
-# -----------------------------
-# 1. Carregamento da série
-# -----------------------------
-caminho_serie = "./dados/dengue_34-1.csv"
-serie_dengue = pd.read_csv(caminho_serie).sort_values(by=["data_iniSE"], ascending=True)
+# ================================
+# 1. Carregar dados
+# ================================
+# Série dengue
+dengue_path = "./dados/dengue.csv"
+serie_dengue = pd.read_csv(dengue_path).sort_values("data_iniSE")
 serie_dengue.index = pd.to_datetime(serie_dengue['data_iniSE'])
 serie_dengue = serie_dengue[['casprov','tempmin','umidmax','umidmed','umidmin','tempmed','tempmax']]
 serie_dengue = serie_dengue.resample("W").mean().interpolate()
 
-# -----------------------------
-# 2. Transformação resposta
-# -----------------------------
-original = serie_dengue['casprov']
-log_transformed = np.log1p(original)
-plot_kde_dengue(original, log_transformed)
+# Transformar variável alvo
+dengue = np.log1p(serie_dengue['casprov'])
 
-# -----------------------------
-# 3. Periodograma
-# -----------------------------
-top_periods = plot_periodogram(log_transformed)
+# Série chuva
+chuva = pd.read_csv("./dados/prec.csv")
+chuva.index = pd.to_datetime(chuva['date'])
+chuva = chuva['precipitation_sum'].resample("W").mean().interpolate()
 
-# -----------------------------
-# 4. Construção X
-# -----------------------------
-y = np.log1p(serie_dengue['casprov'].copy())
-x = serie_dengue[['tempmin','umidmax','umidmed','umidmin','tempmed','tempmax']].copy()
-x = get_lag_exogenous_variables(x)
-get_correlation_map(x)
-
-# Fourier + PCA
-x_all = preprocessing_data(x, top_periods)
-y = y.loc[x_all.index]
+# DataFrame de variáveis exógenas
+variables = {'chuva': chuva, **{c: serie_dengue[c] for c in ['tempmin','tempmed','tempmax','umidmin','umidmed','umidmax']}}
+df_teste = pd.DataFrame(variables).resample('W').mean().interpolate()
 
 
+# --- debug ---
+#n_rows = int(len(df_teste) * 0.3)  # 20% do total
+#df_teste = df_teste.iloc[:n_rows]
+
+# ================================
+# 2. Pré-processamento
+# ================================
+df_teste_proc = preprocess_exog(
+    df_teste,
+    boxcox_vars=["chuva",'tempmin','tempmed','umidmin'],
+    standard_vars=["tempmax","umidmed","umidmax"]
+)
+
 # -----------------------------
-# 5. Split temporal
+# 3. Periodograma da Variavel Alvo
 # -----------------------------
+top_periods = plot_periodogram(dengue, max_lag=60)
+
+# ================================
+# 4. Calcular CCF e melhores lags
+# ================================
+ccf_all, best_lags = compute_best_lags(df_teste_proc, dengue, max_lag=60)
+
+# ================================
+# 5. Construir df_reg pronto para regressão/ARIMAX
+# ================================
+df_reg = build_regression_df(dengue, df_teste_proc, best_lags)
+df_reg = fourie_pca_data(df_reg, top_periods,df_reg['casprov'],quantile=0.5)
+
+# ================================
+# 6. Plotar CCF e destacar melhores lags
+# ================================
+plot_ccf(ccf_all, best_lags)
+
+# -----------------------------
+# 10. Construção X
+# -----------------------------
+y = df_reg['casprov']
+x = df_reg.drop(columns=['casprov'])
+get_correlation_map(df_reg)
+
+
+# -----------------------------
+# 11. Split temporal
+# -----------------------------
+# Dividir em 3 splits
 splits = np.array_split(y.index, 3)
+
 plt.figure(figsize=(12,5))
 sns.lineplot(x=y.index, y=np.expm1(y), label="y", color="black")
+
 for i, split_idx in enumerate(splits, 1):
     split_start, split_end = split_idx[0], split_idx[-1]
     y_split = y.loc[split_start:split_end]
@@ -524,26 +602,34 @@ for i, split_idx in enumerate(splits, 1):
     train_end = y_split.index[train_size-1]
     test_start = y_split.index[train_size]
 
-    plt.axvspan(split_start, train_end, color="skyblue", alpha=0.3)
+    # treino acumulado = do início até o fim do treino atual
+    plt.axvspan(y.index[0], train_end, color="skyblue", alpha=0.2)
+
+    # teste = só o bloco final do split atual
     plt.axvspan(test_start, split_end, color="navajowhite", alpha=0.3)
 
+    # cortes entre splits
     if i < 3:
         plt.axvline(split_end, color="red", linestyle="--", alpha=0.7)
         plt.text(split_end, 200, f"Split {i}→{i+1}", rotation=90,
                  verticalalignment="bottom", horizontalalignment="right")
 
-train_patch = mpatches.Patch(color='skyblue', alpha=0.3, label='Treino')
-test_patch = mpatches.Patch(color='navajowhite', alpha=0.3, label='Teste')
-plt.legend(handles=[train_patch, test_patch,], loc='upper left')
+# legendas
+train_patch = mpatches.Patch(color='skyblue', alpha=0.2, label='Treino acumulado')
+test_patch = mpatches.Patch(color='navajowhite', alpha=0.3, label='Teste atual')
+plt.legend(handles=[train_patch, test_patch], loc='upper left')
+
 plt.ylim(0, np.expm1(y).max()*1.1)
 plt.xlabel("Data")
 plt.ylabel("Casos de Dengue (Escala Original)")
-plt.savefig("./figs/divisao.png", dpi=300)
+plt.title("Divisão temporal com treino acumulado e teste por split")
+plt.savefig("divisao_acumulada.png", dpi=300)
 plt.show()
 
 
+
 # -----------------------------
-# 6.Configuração
+# 12.Configuração
 # -----------------------------
 z = norm.ppf(0.975)  # IC 95%
 use_garch = [False, True, True, ]
@@ -560,7 +646,7 @@ X_accum = pd.DataFrame(dtype=float)
 for i, split_idx in enumerate(splits, 1):
     split_start, split_end = split_idx[0], split_idx[-1]
     y_split = y.loc[split_start:split_end]
-    X_split = x_all.loc[split_start:split_end]
+    X_split = x.loc[split_start:split_end]
 
     # Definir ponto de corte treino/teste dentro do split atual
     train_size = int(len(y_split) * 0.7)
@@ -583,6 +669,8 @@ for i, split_idx in enumerate(splits, 1):
     split_name = str(y_test.index[0].year)
 
     for parameters in list(zip(use_garch, vol)):
+        print(y_test.index[0])
+        print(split_name)
         run_rolling_forecast(y_train_full, y_test, X_train_full, X_test, parameters, horizon, z, split_name)
 
     # Atualiza histórico acumulado com o split inteiro (treino+teste)
@@ -610,3 +698,6 @@ df_resultados.to_csv("./resultado_metricas/resultados_consolidados.csv", index=F
 # -----------------------------
 df_all = load_forecast_results(result_dir="./resultados_modelos/")
 plot_forecast_grid(df_all)
+
+pd.read_csv("./resultado_metricas/resultados_consolidados.csv")
+
